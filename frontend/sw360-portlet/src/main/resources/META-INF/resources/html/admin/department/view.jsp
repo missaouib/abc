@@ -13,9 +13,9 @@
 <%@ include file="/html/utils/includes/errorKeyToMessage.jspf" %>
 <%@ page import="org.eclipse.sw360.portal.common.PortalConstants" %>
 <%--<jsp:useBean id='departmentIsScheduled' type="java.lang.Boolean" scope="request"/>--%>
-<%--<jsp:useBean id='departmentOffset' type="java.lang.String" scope="request"/>--%>
-<%--<jsp:useBean id='departmentInterval' type="java.lang.String" scope="request"/>--%>
-<%--<jsp:useBean id='departmentNextSync' type="java.lang.String" scope="request"/>--%>
+<jsp:useBean id='departmentOffset' type="java.lang.String" scope="request"/>
+<jsp:useBean id='departmentInterval' type="java.lang.String" scope="request"/>
+<jsp:useBean id='departmentNextSync' type="java.lang.String" scope="request"/>
 <portlet:defineObjects/>
 <liferay-theme:defineObjects/>
 <portlet:actionURL var="scheduleDepartmentURL" name="scheduleImportDepartment">
@@ -26,6 +26,10 @@
 </portlet:actionURL>
 <portlet:actionURL var="editPathFolder" name="writePathFolder">
 </portlet:actionURL>
+<portlet:resourceURL var="importDepartmentManually">
+    <portlet:param name="<%=PortalConstants.ACTION%>"
+                   value='<%=PortalConstants.IMPORT_DEPARTMENT_MANUALLY%>'/>
+</portlet:resourceURL>
 <%--<jsp:useBean id="departmentList" scope="request" class="java.util.HashMap"/>--%>
 <%--<jsp:useBean id="allMessageError" scope="request" class="java.util.HashMap"/>--%>
 <%--<jsp:useBean id="lastFileName" scope="request" class="java.lang.String"/>--%>
@@ -49,18 +53,12 @@
                         <tr>
                             <th style="line-height: 40px"><liferay-ui:message key="registration.folder.path"/></th>
                             <td>
-                                <form id="editPathFolder" name="editPathFolder needs-validation"
+                                <form id="editPathFolder" name="editPathFolder" class="needs-validation"
                                       action="<%=editPathFolder%>" method="post" novalidate>
                                     <input id="pathFolderDepartment" style="margin-top: 0" required type="text"
                                            class="form-control"
-                                           name="<portlet:namespace/><%=PortalConstants.DEPARTMENT_URL%>" value=""
-                                           placeholder="${pathConfigFolderDepartment == "" ? "Enter the directory path" : pathConfigFolderDepartment}"/>
-                                    <div class="invalid-feedback" id="error-empty">
-                                        <liferay-ui:message key="please.enter.the.url"/>
-                                    </div>
-                                    <div class="invalid-feedback" id="error-invalid-char">
-                                        <liferay-ui:message key="please.fill.a.z.A.Z.0.9.-...+.only" />
-                                    </div>
+                                           name="<portlet:namespace/><%=PortalConstants.DEPARTMENT_URL%>" value="<sw360:out value="${pathConfigFolderDepartment}"/>"
+                                           placeholder="Enter the directory path"/>
                                 </form>
                             </td>
                             <td width="3%">
@@ -97,8 +95,7 @@
                                     <core_rt:if test="${not departmentIsScheduled}">disabled</core_rt:if> >
                                 <liferay-ui:message key="cancel.department.service"/>
                             </button>
-                            <button type="button" class="btn btn-info"
-                                    onclick="window.location.href='<%=scheduleDepartmentManuallyURL%>'">
+                            <button type="button" class="btn btn-info" data-action="import-department-manually">
                                 <liferay-ui:message key="manually"/>
                             </button>
                             <button type="button" class="btn btn-secondary" id="view-log"><liferay-ui:message
@@ -202,7 +199,8 @@
 <%@ include file="/html/utils/includes/requirejs.jspf" %>
 <script>
     AUI().use('liferay-portlet-url', function () {
-        require(['jquery', 'bridges/datatables', 'utils/includes/quickfilter', 'modules/dialog'], function ($, datatables, quickfilter, dialog) {
+        require(['jquery', 'bridges/datatables', 'utils/includes/quickfilter', 'modules/dialog', 'modules/validation'], function ($, datatables, quickfilter, dialog, validation) {
+            validation.enableForm('#editPathFolder');
             var usersTable;
             $('#view-log').on('click', showDialog);
 
@@ -234,55 +232,98 @@
                 });
             }
 
-            // Check on input type change
-            $('#pathFolderDepartment').on('input', function () {
-                if ($('#editPathFolder').hasClass('was-validated')) {
-                    validateInput();
+            let progress = null;
+            $('.portlet-toolbar button[data-action="import-department-manually"]').on('click', function () {
+                var $dialog;
+                if (progress != null) {
+                    progress.abort();
                 }
+
+                function importDepartmentManually(callback) {
+                    progress = $.ajax({
+                        type: 'POST',
+                        url: '<%=importDepartmentManually%>',
+                        cache: false,
+                        dataType: 'json'
+                    }).always(function () {
+                        callback();
+                    }).done(function (data) {
+                        $('.alert.alert-dialog').hide();
+                        if (data.result === 'SUCCESS') {
+                            $dialog.success(`<liferay-ui:message key="i.imported.x.out.of.y.department" />`);
+                            location.reload();
+                        } else if (data.result === 'PROCESSING') {
+                            $dialog.info('<liferay-ui:message key="importing.process.is.already.running.please.try.again.later" />');
+                        } else {
+                            $dialog.alert('<liferay-ui:message key="error.happened.during.importing.some.department.may.not.be.imported" />');
+                        }
+                    }).fail(function () {
+                        $('.alert.alert-dialog').hide();
+                        $dialog.alert('<liferay-ui:message key="something.went.wrong" />');
+                    });
+                }
+
+                $dialog = dialog.confirm(
+                    null,
+                    'question-circle',
+                    '<liferay-ui:message key="import.department" />?',
+                    '<p id="departmentConfirmMessage"><liferay-ui:message key="do.you.really.want.to.import.department" />',
+                    '<liferay-ui:message key="import.department" />',
+                    {},
+                    function (submit, callback) {
+                        $('#departmentConfirmMessage').hide();
+                        $dialog.info('<liferay-ui:message key="importing.process.is.running.it.may.takes.a.few.minutes" />', true);
+                        $('.modal-header > button').prop('disabled', false);
+                        importDepartmentManually(callback);
+                    }
+                );
             });
 
-            // Check on enter key press
-            $('#pathFolderDepartment').keypress(function (event) {
-                var keycode = (event.keyCode ? event.keyCode : event.which);
-                if (keycode == '13' && !validateInput()) {
-                    event.preventDefault();
-                }
-            });
-
+            // // Check on input type change
+            // $('#pathFolderDepartment').on('input', function () {
+            //     if ($('#editPathFolder').hasClass('was-validated')) {
+            //         validateInput();
+            //     }
+            // });
+            //
+            // // Check on enter key press
+            // $('#pathFolderDepartment').keypress(function (event) {
+            //     var keycode = (event.keyCode ? event.keyCode : event.which);
+            //     if (keycode == '13' && !validateInput()) {
+            //         event.preventDefault();
+            //     }
+            // });
+            //
             $('.portlet-toolbar button[data-action="save"]').on('click', function (event) {
-                event.preventDefault();
-                if (validateInput()) {
-                    $('#editPathFolder').submit();
-                }
+                $('#editPathFolder').submit();
             });
-
-            function validateInput() {
-                $('#editPathFolder').removeClass('needs-validation');
-                $('#pathFolderDepartment')[0].setCustomValidity('');
-                $('.invalid-feedback').css('display', 'none');
-                $('.invalid-feedback').removeClass('d-block');
-
-                let pathFolderDepartment = $('#pathFolderDepartment').val();
-
-                if (pathFolderDepartment.length === 0 || $.trim(pathFolderDepartment).length === 0) {
-                    $('#editPathFolder').addClass('was-validated');
-                    $('#pathFolderDepartment')[0].setCustomValidity('error');
-                    $('#error-empty').addClass('d-block');
-                    return false;
-                };
-
-                const valid=/^[a-zA-Z]:\\(\w+\\)*\w*$/;
-                if(!pathFolderDepartment.match(valid)){
-                    $('#editPathFolder').addClass('was-validated');
-                    $('#pathFolderDepartment')[0].setCustomValidity('error');
-                    $('#error-invalid-char').addClass('d-block');
-                    return false;
-                };
-
-                return true;
-            }
-            <%--if (${pathConfigFolderDepartment})--%>
-            <%--$("#pathFolderDepartment").attr('placeholder', ${pathConfigFolderDepartment});--%>
+            //
+            // function validateInput() {
+            //     $('#editPathFolder').removeClass('needs-validation');
+            //     $('#pathFolderDepartment')[0].setCustomValidity('');
+            //     $('.invalid-feedback').css('display', 'none');
+            //     $('.invalid-feedback').removeClass('d-block');
+            //
+            //     let pathFolderDepartment = $('#pathFolderDepartment').val();
+            //
+            //     if (pathFolderDepartment.length === 0 || $.trim(pathFolderDepartment).length === 0) {
+            //         $('#editPathFolder').addClass('was-validated');
+            //         $('#pathFolderDepartment')[0].setCustomValidity('error');
+            //         $('#error-empty').addClass('d-block');
+            //         return false;
+            //     }
+            //     ;
+            //
+            //     // const valid=/^[a-zA-Z]:\\(\w+\\)*\w*$/;
+            //     // if(!pathFolderDepartment.match(valid)){
+            //     //     $('#editPathFolder').addClass('was-validated');
+            //     //     $('#pathFolderDepartment')[0].setCustomValidity('error');
+            //     //     $('#error-invalid-char').addClass('d-block');
+            //     //     return false;
+            //     // };
+            //
+            //     return true;
+            // }
         });
     });
     $('#file-log').on('change', function () {

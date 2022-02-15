@@ -10,7 +10,6 @@
 package org.eclipse.sw360.users.db;
 
 import com.cloudant.client.api.CloudantClient;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.opencsv.CSVReader;
 import com.opencsv.CSVReaderBuilder;
 import com.opencsv.exceptions.CsvException;
@@ -27,19 +26,16 @@ import org.eclipse.sw360.datahandler.thrift.*;
 import org.eclipse.sw360.datahandler.thrift.users.RequestedAction;
 import org.eclipse.sw360.datahandler.thrift.users.User;
 import org.eclipse.sw360.datahandler.thrift.users.UserGroup;
-import org.eclipse.sw360.users.dto.ApiResponse;
 import org.eclipse.sw360.users.dto.Issue;
 import org.eclipse.sw360.users.dto.RedmineConfigDTO;
-import org.eclipse.sw360.users.dto.UserDTO;
 import org.eclipse.sw360.users.redmine.ReadFileRedmineConfig;
 import org.eclipse.sw360.users.util.FileUtil;
 import org.ektorp.http.HttpClient;
 
 import java.io.*;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.util.*;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import static org.eclipse.sw360.datahandler.permissions.PermissionUtils.makePermission;
 
@@ -57,13 +53,14 @@ public class UserDatabaseHandler {
     private DatabaseConnector dbConnector;
     private UserRepository repository;
     private UserSearchHandler userSearchHandler;
-    private Map<String, UserDTO> userDTOMap;
     private static final Logger log = LogManager.getLogger(UserDatabaseHandler.class);
-    private static final String DEPARTMENT = "DEPARTMENT";
     private ReadFileRedmineConfig readFileRedmineConfig;
     private static final String INFO = "INFO";
     private static final String ERROR = "ERROR";
     private static boolean IMPORT_STATUS = false;
+    private List<Issue> listIssueSuccess = new ArrayList<>();
+    private List<Issue> listIssueFail = new ArrayList<>();
+    private List<String> listString = new ArrayList<>();
 
     public UserDatabaseHandler(Supplier<CloudantClient> httpClient, String dbName) throws IOException {
         // Create the connector
@@ -83,7 +80,8 @@ public class UserDatabaseHandler {
     }
 
     public User getByEmail(String email) {
-        return repository.getByEmail(email);
+        return repository.getByEmail(email)
+                ;
     }
 
     public User getUser(String id) {
@@ -153,92 +151,101 @@ public class UserDatabaseHandler {
     public RequestSummary importFileToDB(String pathFolder) {
         String functionName = new Object() {
         }.getClass().getEnclosingMethod().getName();
-//        responseData();
-        RequestSummary requestSummary = new RequestSummary().setTotalAffectedElements(0).setMessage("");
+        RequestSummary requestSummary = new RequestSummary().setTotalAffectedElements(0).setMessage("").setRequestStatus(RequestStatus.SUCCESS);
         RedmineConfigDTO configDTO = readFileRedmineConfig.readFileJson();
+        List<Map<String, List<String>>> mapArrayList = new ArrayList<>();
         if (IMPORT_STATUS) {
             return requestSummary.setRequestStatus(RequestStatus.PROCESSING);
         }
-        log.info("*********IMPORT_STATUS false**********" + IMPORT_STATUS);
         IMPORT_STATUS = true;
-        log.info("*********IMPORT_STATUS true**********" + IMPORT_STATUS);
-
+        log.info("***********1.IMPORT_STATUS**********" + IMPORT_STATUS);
         try {
-            FileUtil.writeErrorToFile(INFO, functionName, "START", configDTO.getPathFolderLog());
-            List<User> users = repository.getAll();
-            userDTOMap = new HashMap<>();
-            for (User user : users) {
-                UserDTO userDTO = UserDTO.convertToUserDTO(user);
-                userDTOMap.put(user.getEmail(), userDTO);
-            }
+            FileUtil.writeLogToFile(INFO, functionName, "START", configDTO.getPathFolderLog());
             Set<String> files = FileUtil.listFilesUsingFileWalk(pathFolder);
             for (String file : files) {
-                checkFileFormat(pathFolder + "/" + file);
-            }
-            userDTOMap.forEach((key, value) -> {
-                if (value.getId() == null || value.getId().isEmpty() || value.getId().equals("")) {
-                    repository.add(value.convertToUser());
-                } else {
-                    repository.update(value.convertToUserUpdate());
+                String pathFile = pathFolder + "/" + file;
+                String extension = FilenameUtils.getExtension(pathFile);
+                if (extension.equalsIgnoreCase("xlsx") || extension.equalsIgnoreCase("xls")) {
+                    mapArrayList = readFileExcel(pathFile);
+                } else if (extension.equalsIgnoreCase("csv")) {
+                    mapArrayList = readFileCsv(pathFile);
                 }
-            });
-            requestSummary.setRequestStatus(RequestStatus.SUCCESS);
+                List<String> strings = validateListEmailExistDB(mapArrayList);
+                List<String> departmentDuplicate = validateListDepartmentDuplicate(mapArrayList);
+                if (!departmentDuplicate.isEmpty()) {
+                    mapArrayList.forEach(ma -> {
+                        ma.forEach(this::updateDepartmentToUser);
+                    });
+                    Issue issueSuccess = new Issue();
+                } else {
+                    Issue issueFail = new Issue();
+                    requestSummary.setRequestStatus(RequestStatus.INVALID_INPUT);
+                }
+
+                if (!strings.isEmpty()) {
+                    mapArrayList.forEach(ma -> {
+                        ma.forEach(this::updateDepartmentToUser);
+                    });
+                    Issue issueSuccess = new Issue();
+                } else {
+                    Issue issueFail = new Issue();
+                    requestSummary.setRequestStatus(RequestStatus.INVALID_INPUT);
+                }
+            }
+
+
             IMPORT_STATUS = false;
-            log.info("*********IMPORT_STATUS false end**********" + IMPORT_STATUS);
-            FileUtil.writeErrorToFile(INFO, functionName, "END", configDTO.getPathFolderLog());
-        } catch (IOException e) {
+            FileUtil.writeLogToFile(INFO, functionName, "END", configDTO.getPathFolderLog());
+        } catch (Exception e) {
             IMPORT_STATUS = false;
-            FileUtil.writeErrorToFile(ERROR, functionName, e.getMessage(), configDTO.getPathFolderLog());
+            FileUtil.writeLogToFile(ERROR, functionName, e.getMessage(), configDTO.getPathFolderLog());
             String msg = "Failed to import department";
             log.error("Can't read file: {}", e.getMessage());
             requestSummary.setMessage(msg);
             requestSummary.setRequestStatus(RequestStatus.FAILURE);
         }
+        log.info("***********2.IMPORT_STATUS**********" + IMPORT_STATUS);
         return requestSummary;
     }
 
-    private void checkFileFormat(String pathFile) {
-        String extension = FilenameUtils.getExtension(pathFile);
-        if (extension.equalsIgnoreCase("xlsx") || extension.equalsIgnoreCase("xls")) {
-            readFileExcel(pathFile);
-        } else if (extension.equalsIgnoreCase("csv")){
-            readFileCsv(pathFile);
-        }
-    }
-
-    public void readFileCsv(String filePath) {
+    public List<Map<String, List<String>>> readFileCsv(String filePath) {
         String functionName = new Object() {
         }.getClass().getEnclosingMethod().getName();
+        List<Map<String, List<String>>> mapList = new ArrayList<>();
         RedmineConfigDTO configDTO = readFileRedmineConfig.readFileJson();
-        FileUtil.writeErrorToFile(INFO, functionName, "START", configDTO.getPathFolderLog());
+        FileUtil.writeLogToFile(INFO, functionName, "START", configDTO.getPathFolderLog());
         try {
             File file = new File(filePath);
-            FileUtil.writeErrorToFile(INFO, functionName, file.getName(), configDTO.getPathFolderLog());
+            FileUtil.writeLogToFile(INFO, functionName, file.getName(), configDTO.getPathFolderLog());
             CSVReader reader = new CSVReaderBuilder(new FileReader(file)).withSkipLines(1).build();
             List<String[]> rows = reader.readAll();
             String mapTemp = "";
             for (String[] row : rows) {
                 if (row.length > 1) {
                     if (!Objects.equals(row[0], "")) mapTemp = row[0];
-                    checkUser(row[1], mapTemp);
+
                 }
-//                log.info("********mapTemp*************"+mapTemp);
             }
-            FileUtil.writeErrorToFile(INFO, functionName, "END", configDTO.getPathFolderLog());
+            FileUtil.writeLogToFile(INFO, functionName, "END", configDTO.getPathFolderLog());
         } catch (IOException | CsvException e) {
             log.error("Can't read file csv: {}", e.getMessage());
-            FileUtil.writeErrorToFile(ERROR, functionName, e.getMessage(), configDTO.getPathFolderLog());
+            FileUtil.writeLogToFile(ERROR, functionName, e.getMessage(), configDTO.getPathFolderLog());
         }
+        return mapList;
     }
 
-    public void readFileExcel(String filePath) {
+    public List<Map<String, List<String>>> readFileExcel(String filePath) {
         String functionName = new Object() {
         }.getClass().getEnclosingMethod().getName();
         RedmineConfigDTO configDTO = readFileRedmineConfig.readFileJson();
+        List<Map<String, List<String>>> mapListFileExcel = new ArrayList<>();
+        Map<String, List<String>> listMap = new HashMap<>();
+        List<String> emailExcel = new ArrayList<>();
+
         Workbook wb = null;
-        FileUtil.writeErrorToFile(INFO, functionName, "START", configDTO.getPathFolderLog());
+        FileUtil.writeLogToFile(INFO, functionName, "START", configDTO.getPathFolderLog());
         try (InputStream inp = new FileInputStream(filePath)) {
-            FileUtil.writeErrorToFile(INFO, functionName, FilenameUtils.getName(filePath), configDTO.getPathFolderLog());
+            FileUtil.writeLogToFile(INFO, functionName, FilenameUtils.getName(filePath), configDTO.getPathFolderLog());
             wb = WorkbookFactory.create(inp);
             Sheet sheet = wb.getSheetAt(0);
             Iterator<Row> rows = sheet.iterator();
@@ -247,14 +254,26 @@ public class UserDatabaseHandler {
             while (rows.hasNext()) {
                 Row row = rows.next();
                 if (!isRowEmpty(row)) {
-                    if (row.getCell(0) != null) mapTemp = row.getCell(0).getStringCellValue();
-                    checkUser(row.getCell(1).getStringCellValue(), mapTemp);
+                    if (row.getCell(0) != null) {
+                        if (!mapTemp.isEmpty()) {
+                            listMap.put(mapTemp, emailExcel);
+                            mapListFileExcel.add(listMap);
+                            emailExcel.clear();
+                            // listMap.clear();
+                        }
+                        mapTemp = row.getCell(0).getStringCellValue();
+                    }
+                    String email = row.getCell(1).getStringCellValue();
+                    emailExcel.add(email);
                 }
             }
-            FileUtil.writeErrorToFile(INFO, functionName, "END", configDTO.getPathFolderLog());
+            listMap.put(mapTemp, emailExcel);
+            mapListFileExcel.add(listMap);
+
+            FileUtil.writeLogToFile(INFO, functionName, "END", configDTO.getPathFolderLog());
         } catch (Exception ex) {
             log.error("Can't read file excel: {}", ex.getMessage());
-            FileUtil.writeErrorToFile(ERROR, functionName, ex.getMessage(), configDTO.getPathFolderLog());
+            FileUtil.writeLogToFile(ERROR, functionName, ex.getMessage(), configDTO.getPathFolderLog());
         } finally {
             try {
                 if (wb != null) wb.close();
@@ -262,6 +281,7 @@ public class UserDatabaseHandler {
                 log.error(e.getMessage());
             }
         }
+        return mapListFileExcel;
     }
 
     public static boolean isRowEmpty(Row row) {
@@ -276,27 +296,6 @@ public class UserDatabaseHandler {
             }
         }
         return isEmpty;
-    }
-
-    private void checkUser(String email, String apartment) {
-        UserDTO userDTO = userDTOMap.get(email);
-        if (userDTO == null) {
-            UserDTO u = new UserDTO();
-            u.setEmail(email);
-            u.setDepartment(DEPARTMENT);
-            Set<UserGroup> userGroups = new HashSet<>();
-            userGroups.add(UserGroup.USER);
-            Map<String, Set<UserGroup>> map = new HashMap<>();
-            map.put(apartment, userGroups);
-            u.setSecondaryDepartmentsAndRoles(map);
-            userDTOMap.put(email, u);
-        } else {
-            if (!userDTO.getSecondaryDepartmentsAndRoles().containsKey(apartment)) {
-                Set<UserGroup> userGroups = new HashSet<>();
-                userGroups.add(UserGroup.USER);
-                userDTO.getSecondaryDepartmentsAndRoles().put(apartment, userGroups);
-            }
-        }
     }
 
     public Map<String, List<User>> getAllUserByDepartment() {
@@ -319,36 +318,19 @@ public class UserDatabaseHandler {
         return listMap;
     }
 
-//    public void responseData() {
+//    public void responseData(List<Object> success, List<Object> fails) {
 //        try {
+//            ApiResponse response = new ApiResponse();
 //            URL url = new URL("http://10.116.41.47:3000/redmine");
 //            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
 //            conn.setDoOutput(true);
 //            conn.setRequestMethod("POST");
 //            conn.setRequestProperty("Content-Type", "application/json");
-//            Issue issue = new Issue();
-//            issue.setIssue_id("27");
-//            issue.setDescription("description_27");
-//            Issue issue1 = new Issue();
-//            issue1.setIssue_id("28");
-//            issue1.setDescription("description_28");
-//            Issue issue2 = new Issue();
-//            issue2.setIssue_id("29");
-//            issue2.setDescription("description_29");
-//            Issue issue3 = new Issue();
-//            issue3.setIssue_id("30");
-//            issue3.setDescription("description_30");
-//            List<Object> issues = new ArrayList<>();
-//            List<Object> issuesFail = new ArrayList<>();
-//            issuesFail.add(issue3);
-//            issues.add(issue);
-//            issues.add(issue1);
-//            issues.add(issue2);
+//            response.setSuccess(success);
+//            response.setFail(fails);
 //            ObjectMapper mapper = new ObjectMapper();
-//            ApiResponse responseIssue = new ApiResponse();
-//            responseIssue.setSuccess(issues);
-//            responseIssue.setFail(issuesFail);
-//            String arrayToJson = mapper.writeValueAsString(responseIssue);
+//            String arrayToJson = mapper.writeValueAsString(response);
+//            log.info("***************arrayToJson********************" + arrayToJson);
 //            OutputStream os = conn.getOutputStream();
 //            os.write(arrayToJson.getBytes());
 //            os.flush();
@@ -363,5 +345,52 @@ public class UserDatabaseHandler {
 //            e.printStackTrace();
 //        }
 //    }
+
+    public void updateDepartmentToUser(String department, List<String> emails) {
+
+        if (!emails.isEmpty() && department != null) {
+            for (String email : emails) {
+                User user = repository.getByEmail(email);
+                Map<String, Set<UserGroup>> map;
+                Set<UserGroup> userGroups = new HashSet<>();
+                if (user.getSecondaryDepartmentsAndRoles() != null) {
+                    map = user.getSecondaryDepartmentsAndRoles();
+                    for (Map.Entry<String, Set<UserGroup>> entry : map.entrySet()) {
+                        if (entry.getKey().equals(department)) {
+                            userGroups = entry.getValue();
+                        }
+                    }
+                } else {
+                    map = new HashMap<>();
+                }
+                userGroups.add(UserGroup.USER);
+                map.put(department, userGroups);
+                user.setSecondaryDepartmentsAndRoles(map);
+                repository.update(user);
+            }
+        }
+    }
+
+    public List<String> validateListEmailExistDB(List<Map<String, List<String>>> mapList) {
+        List<String> emailNotExist = new ArrayList<>();
+        Set<String> a = new HashSet<>();
+        mapList.forEach(m -> m.forEach((v, k) -> a.addAll(k)));
+        for (String as : a) {
+            User user = repository.getByEmail(as);
+            if (user == null) {
+                emailNotExist.add(as);
+            }
+        }
+        return emailNotExist;
+    }
+
+    public List<String> validateListDepartmentDuplicate(List<Map<String, List<String>>> mapList) {
+        List<String> departments = new ArrayList<>();
+        mapList.forEach(m -> m.forEach((v, k) -> {
+            departments.add(v);
+        }));
+        return departments.stream()
+                .filter(i -> Collections.frequency(departments, i) > 1).distinct().collect(Collectors.toList());
+    }
 
 }
