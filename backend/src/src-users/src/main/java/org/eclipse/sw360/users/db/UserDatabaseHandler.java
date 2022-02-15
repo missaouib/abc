@@ -10,9 +10,13 @@
 package org.eclipse.sw360.users.db;
 
 import com.cloudant.client.api.CloudantClient;
+import com.github.andrewoma.dexx.collection.ArrayList;
+import com.github.andrewoma.dexx.collection.HashMap;
+import com.github.andrewoma.dexx.collection.Map;
 import com.opencsv.CSVReader;
 import com.opencsv.CSVReaderBuilder;
 import com.opencsv.exceptions.CsvException;
+import org.apache.catalina.User;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -61,6 +65,8 @@ public class UserDatabaseHandler {
     private List<Issue> listIssueSuccess = new ArrayList<>();
     private List<Issue> listIssueFail = new ArrayList<>();
     private List<String> listString = new ArrayList<>();
+    private List<String> departmentDuplicate = new ArrayList<>();
+    private List<String> emailDoNotExist = new ArrayList<>();
 
     public UserDatabaseHandler(Supplier<CloudantClient> httpClient, String dbName) throws IOException {
         // Create the connector
@@ -153,7 +159,7 @@ public class UserDatabaseHandler {
         }.getClass().getEnclosingMethod().getName();
         RequestSummary requestSummary = new RequestSummary().setTotalAffectedElements(0).setMessage("").setRequestStatus(RequestStatus.SUCCESS);
         RedmineConfigDTO configDTO = readFileRedmineConfig.readFileJson();
-        List<Map<String, List<String>>> mapArrayList = new ArrayList<>();
+        Map<String, List<String>> mapArrayList = new HashMap<>();
         if (IMPORT_STATUS) {
             return requestSummary.setRequestStatus(RequestStatus.PROCESSING);
         }
@@ -170,26 +176,28 @@ public class UserDatabaseHandler {
                 } else if (extension.equalsIgnoreCase("csv")) {
                     mapArrayList = readFileCsv(pathFile);
                 }
-                List<String> strings = validateListEmailExistDB(mapArrayList);
-                List<String> departmentDuplicate = validateListDepartmentDuplicate(mapArrayList);
-                if (!departmentDuplicate.isEmpty()) {
-                    mapArrayList.forEach(ma -> {
-                        ma.forEach(this::updateDepartmentToUser);
+                Map<String, User> mapEmail = validateListEmailExistDB(mapArrayList);
+                if (departmentDuplicate.size() == 0 && emailDoNotExist.size() == 0) {
+                    mapArrayList.forEach((k, v) -> {
+                        updateDepartmentToUser(k,mapEmail.get(v));
                     });
-                    Issue issueSuccess = new Issue();
-                } else {
-                    Issue issueFail = new Issue();
-                    requestSummary.setRequestStatus(RequestStatus.INVALID_INPUT);
-                }
-
-                if (!strings.isEmpty()) {
-                    mapArrayList.forEach(ma -> {
-                        ma.forEach(this::updateDepartmentToUser);
-                    });
-                    Issue issueSuccess = new Issue();
-                } else {
-                    Issue issueFail = new Issue();
-                    requestSummary.setRequestStatus(RequestStatus.INVALID_INPUT);
+                    Issue issue = new Issue();
+                    String joined = String.join(", ", mapArrayList.keySet());
+                    issue.setDescription("Departmen "+joined+" updated success - File: "+file);
+                    listIssueSuccess.add(issueFail);
+                }else {
+                    if (departmentDuplicate.size()>0){
+                        Issue issueFail = new Issue();
+                        String joined = String.join(", ", departmentDuplicate);
+                        issueFail.setDescription("Departmen "+joined+" is duplicate - File: "+file);
+                        listIssueFail.add(issueFail);
+                    }
+                    if (emailDoNotExist.size()>0){
+                        Issue issueFail = new Issue();
+                        String joined = String.join(", ", emailDoNotExist);
+                        issueFail.setDescription("Email "+joined+" do not exist - File: "+file);
+                        listIssueFail.add(issueFail);
+                    }
                 }
             }
 
@@ -234,11 +242,10 @@ public class UserDatabaseHandler {
         return mapList;
     }
 
-    public List<Map<String, List<String>>> readFileExcel(String filePath) {
+    public Map<String, List<String>> readFileExcel(String filePath) {
         String functionName = new Object() {
         }.getClass().getEnclosingMethod().getName();
         RedmineConfigDTO configDTO = readFileRedmineConfig.readFileJson();
-        List<Map<String, List<String>>> mapListFileExcel = new ArrayList<>();
         Map<String, List<String>> listMap = new HashMap<>();
         List<String> emailExcel = new ArrayList<>();
 
@@ -254,12 +261,17 @@ public class UserDatabaseHandler {
             while (rows.hasNext()) {
                 Row row = rows.next();
                 if (!isRowEmpty(row)) {
+
+                    // department have value
                     if (row.getCell(0) != null) {
+//                        check maptemp do exist
                         if (!mapTemp.isEmpty()) {
+//                            checkduplicate department
+                            if (listMap.containsKey(mapTemp)) {
+                                departmentDuplicate.add(mapTemp);
+                            }
                             listMap.put(mapTemp, emailExcel);
-                            mapListFileExcel.add(listMap);
-                            emailExcel.clear();
-                            // listMap.clear();
+                            emailExcel = new ArrayList<>();
                         }
                         mapTemp = row.getCell(0).getStringCellValue();
                     }
@@ -267,8 +279,10 @@ public class UserDatabaseHandler {
                     emailExcel.add(email);
                 }
             }
+            if (listMap.containsKey(mapTemp)) {
+                departmentDuplicate.add(mapTemp);
+            }
             listMap.put(mapTemp, emailExcel);
-            mapListFileExcel.add(listMap);
 
             FileUtil.writeLogToFile(INFO, functionName, "END", configDTO.getPathFolderLog());
         } catch (Exception ex) {
@@ -281,7 +295,7 @@ public class UserDatabaseHandler {
                 log.error(e.getMessage());
             }
         }
-        return mapListFileExcel;
+        return listMap;
     }
 
     public static boolean isRowEmpty(Row row) {
@@ -371,26 +385,38 @@ public class UserDatabaseHandler {
         }
     }
 
-    public List<String> validateListEmailExistDB(List<Map<String, List<String>>> mapList) {
-        List<String> emailNotExist = new ArrayList<>();
-        Set<String> a = new HashSet<>();
-        mapList.forEach(m -> m.forEach((v, k) -> a.addAll(k)));
-        for (String as : a) {
-            User user = repository.getByEmail(as);
-            if (user == null) {
-                emailNotExist.add(as);
+    public void updateDepartmentToUser(String department, User user) {
+        Map<String, Set<UserGroup>> map;
+        Set<UserGroup> userGroups = new HashSet<>();
+        if (user.getSecondaryDepartmentsAndRoles() != null) {
+            map = user.getSecondaryDepartmentsAndRoles();
+            for (Map.Entry<String, Set<UserGroup>> entry : map.entrySet()) {
+                if (entry.getKey().equals(department)) {
+                    userGroups = entry.getValue();
+                }
             }
+        } else {
+            map = new HashMap<>();
         }
-        return emailNotExist;
+        userGroups.add(UserGroup.USER);
+        map.put(department, userGroups);
+        user.setSecondaryDepartmentsAndRoles(map);
+        repository.update(user);
     }
 
-    public List<String> validateListDepartmentDuplicate(List<Map<String, List<String>>> mapList) {
-        List<String> departments = new ArrayList<>();
-        mapList.forEach(m -> m.forEach((v, k) -> {
-            departments.add(v);
-        }));
-        return departments.stream()
-                .filter(i -> Collections.frequency(departments, i) > 1).distinct().collect(Collectors.toList());
+    public Map<String, User> validateListEmailExistDB(Map<String, List<String>> mapList) {
+        Map<String, User> listUser = new HashMap<>();
+        Set<String> setEmail = new HashSet<>();
+        mapList.forEach((v, k) -> setEmail.addAll(k));
+        for (String email : setEmail) {
+            User user = repository.getByEmail(email);
+            if (user == null) {
+                emailDoNotExist.add(email);
+            } else {
+                listUser.put(email, user);
+            }
+        }
+        return listUser;
     }
 
 }
